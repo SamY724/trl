@@ -13,12 +13,11 @@
 # limitations under the License.
 
 import atexit
-import base64
 import logging
 import socket
 import time
-from io import BytesIO
-from typing import Optional, Union
+from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import urlparse
 
 import torch
@@ -78,16 +77,14 @@ class VLLMClient:
 
         ```python
         >>> from trl.extras.vllm_client import VLLMClient
-
         >>> client = VLLMClient()
         >>> client.generate(["Hello, AI!", "Tell me a joke"])
         [[2980, 498, 1492, 752, 448, 264, 13027, 8645, 30, 358, 2776, 4460, 311, 3270, 264, 2025],
          [911, 7988, 1251, 382, 3838, 653, 498, 1618, 4325, 879, 2581, 20027, 264, 21428, 30, 362]]
 
         >>> from transformers import AutoModelForCausalLM
-
         >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", device_map="cuda")
-        >>> client.init_communicator(device="cuda")
+        >>> client.init_communicator()
         >>> client.update_model_params(model)
         ```
 
@@ -168,7 +165,6 @@ class VLLMClient:
     def generate(
         self,
         prompts: list[str],
-        images: Optional[list] = None,
         n: int = 1,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -177,7 +173,7 @@ class VLLMClient:
         min_p: float = 0.0,
         max_tokens: int = 16,
         guided_decoding_regex: Optional[str] = None,
-        generation_kwargs: Optional[dict] = None,
+        stop: Optional[list[str]] = None,
     ) -> list[list[int]]:
         """
         Generates model completions for the provided prompts.
@@ -185,8 +181,6 @@ class VLLMClient:
         Args:
             prompts (`list[str]`):
                 List of text prompts for which the model will generate completions.
-            images (`list[PIL.Image]` or `None`, *optional*, defaults to `None`):
-                List of PIL Images to send along with the prompts.
             n (`int`, *optional*, defaults to `1`):
                 Number of completions to generate for each prompt.
             repetition_penalty (`float`, *optional*, defaults to `1.0`):
@@ -203,34 +197,18 @@ class VLLMClient:
                 Maximum number of tokens to generate for each prompt.
             guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
                 Regular expression to guide the decoding process.
-            generation_kwargs (`dict` or `None`, *optional*, defaults to `None`):
-                Additional generation parameters to pass to the vLLM `SamplingParams`. This can include parameters like
-                `seed`, `frequency_penalty`, etc. If it contains keys that conflict with the other parameters, they
-                will override them.
+            stop (`list[str]` or `None`, *optional*, defaults to `None`):
+                List of stop sequences. The generation will stop when any of these sequences is encountered.
 
         Returns:
-            `dict` with keys:
-                - `completion_ids` (`list[list[int]]`):
-                    List of lists of token IDs representing the model-generated completions for each prompt.
-                - `logprobs` (`list[list[float]]`):
-                    List of lists of log probabilities for each generated token.
+            `list[list[int]]`:
+                List of lists of token IDs representing the model-generated completions for each prompt.
         """
         url = f"{self.base_url}/generate/"
-
-        def pil_to_base64(image):
-            buffer = BytesIO()
-            image.save(buffer, format="PNG")
-            img_bytes = buffer.getvalue()
-            return base64.b64encode(img_bytes).decode("utf-8")
-
-        # Convert PIL images to base64 strings
-        images = [pil_to_base64(img) for img in images] if images else None
-
         response = self.session.post(
             url,
             json={
                 "prompts": prompts,
-                "images": images,
                 "n": n,
                 "repetition_penalty": repetition_penalty,
                 "temperature": temperature,
@@ -239,23 +217,17 @@ class VLLMClient:
                 "min_p": min_p,
                 "max_tokens": max_tokens,
                 "guided_decoding_regex": guided_decoding_regex,
-                "generation_kwargs": generation_kwargs or {},
+                "stop": stop,
             },
         )
         if response.status_code == 200:
-            json_response = response.json()
-            return {"completion_ids": json_response["completion_ids"], "logprobs": json_response["logprobs"]}
+            return response.json()["completion_ids"]
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
-    def init_communicator(self, device: Union[torch.device, str, int] = 0):
+    def init_communicator(self):
         """
         Initializes the weight update group in a distributed setup for model synchronization.
-
-        Args:
-            device (`torch.device`, `str`, or `int`, *optional*, defaults to `0`):
-                Device of trainer main process. It's the device that will be used for the weights synchronization. Can
-                be a `torch.device` object, a string like `'cuda:0'`, or an integer device index.
         """
         # Get the world size from the server
         url = f"{self.base_url}/get_world_size/"
@@ -270,18 +242,8 @@ class VLLMClient:
 
         # Initialize weight update group
         url = f"{self.base_url}/init_communicator/"
-        client_device_uuid = str(torch.cuda.get_device_properties(device).uuid)
-
         # In the server side, the host is set to 0.0.0.0
-        response = self.session.post(
-            url,
-            json={
-                "host": "0.0.0.0",
-                "port": self.group_port,
-                "world_size": world_size,
-                "client_device_uuid": client_device_uuid,
-            },
-        )
+        response = self.session.post(url, json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size})
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
@@ -292,7 +254,7 @@ class VLLMClient:
 
         # Set up the communication group for weight broadcasting
         pg = StatelessProcessGroup.create(host=self.host, port=self.group_port, rank=self.rank, world_size=world_size)
-        self.pynccl_comm = PyNcclCommunicator(pg, device=device)
+        self.pynccl_comm = PyNcclCommunicator(pg, device=0)
 
         # When the client object is deleted, close the weight update group
         atexit.register(self.close_communicator)
@@ -354,12 +316,27 @@ class VLLMClient:
                 raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
 
+@dataclass
+class VLLMClientGenerationConfig:
+    """Configuration for VLLM client generation parameters"""
+
+    n: int
+    repetition_penalty: float
+    temperature: float
+    top_p: float
+    top_k: Optional[int]
+    min_p: float
+    max_tokens: int
+    guided_decoding_regex: Optional[str] = None
+    stop: Optional[list[str]] = None
+
+
 # Example usage
 if __name__ == "__main__":
     from vllm import SamplingParams
 
     client = VLLMClient()
-    client.init_communicator(device="cuda")
+    client.init_communicator()
 
     # Generate completions
     responses = client.generate(["Hello, AI!", "Tell me a joke"], n=4, max_tokens=32, sampling_params=SamplingParams())
