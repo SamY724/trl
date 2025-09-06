@@ -38,7 +38,6 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 from ..import_utils import is_vllm_available
 
-# Optional imports for future extensibility
 try:
     from e2b_code_interpreter import AsyncSandbox
     _e2b_available = True
